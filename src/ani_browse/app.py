@@ -27,17 +27,6 @@ import json
 from pathlib import Path
 import webbrowser
 
-# class AnimeListRow(Static):
-#     def __init__(self, anime: Anime) -> None:
-#         self.anime = anime
-
-#         score = f"{anime.score:.1f}" if anime.score is not None else "N/A"
-#         secondary = anime.season if anime.season else anime.status
-#         title = f"#{anime.rank} {anime.title}" if anime.rank is not None else anime.title
-
-#         text = f"[b]{title}[/b]\n[dim]{score} • {secondary}[/dim]"
-#         super().__init__(text, classes="anime-row")
-
 class AnimeListRow(Static):
     def __init__(self, anime: Anime) -> None:
         self.anime = anime
@@ -51,24 +40,11 @@ class SeasonListRow(Static):
         self.year = year
         self.season = season
 
+class EpisodeListRow(Static):
+    def __init__(self, episode: int) -> None:
+        super().__init__(f"Episode {episode}", classes="episode-row")
+        self.episode = episode
 
-# class AnimeDetails(Static):
-#     def show_anime(self, anime: Anime) -> None:
-#         score = f"{anime.score:.1f}" if anime.score is not None else "N/A"
-#         episodes = anime.episodes if anime.episodes is not None else "N/A"
-#         genres = ", ".join(anime.genres) if anime.genres else "N/A"
-
-#         self.update(
-#             f"[b]{anime.title}[/b]\n"
-#             f"{'─' * len(anime.title)}\n\n"
-#             f"[b]Score:[/b] {score}\n"
-#             f"[b]Episodes:[/b] {episodes}\n"
-#             f"[b]Status:[/b] {anime.status}\n"
-#             f"[b]Season:[/b] {anime.season}\n"
-#             f"[b]Genres:[/b] {genres}\n\n"
-#             f"[b]Synopsis[/b]\n"
-#             f"{anime.synopsis}"
-#         )
 class AnimeDetails(Static):
     def show_anime(self, anime: Anime) -> None:
         self.update(anime.details_text)
@@ -148,15 +124,26 @@ class AniBrowseApp(App):
             text-style: bold;
             color: $text;
         }
+
+        .episode-row {
+            text-style: bold;
+            color: $text;
+        }
+
+        .episode-list-item {
+            height: 1;
+            padding: 0 1;
+        }
     """
 
     BINDINGS = [
         Binding("/", "focus_search", "Search"),
         Binding("escape", "unfocus_search", "Back", show=False),
-        Binding("s", "switch_view('seasonal')", "Seasonal"),
-        Binding("t", "switch_view('top')", "Top"),
-        Binding("p", "switch_view('popular')", "Popular"),
-        Binding("u", "switch_view('upcoming')", "Upcoming"),
+        Binding("s", "switch_view('seasonal')", "Seasonal Anime"),
+        Binding("t", "switch_view('top')", "Top Anime"),
+        Binding("p", "switch_view('popular')", "Popular Anime"),
+        Binding("u", "switch_view('upcoming')", "Upcoming Anime"),
+        Binding("e", "show_episode_picker", "Episodes"),
         Binding("d", "toggle_dub", "Dub"),
         Binding("comma", "previous_page", "Prev Page", show=False),
         Binding("full_stop", "next_page", "Next Page", show=False),
@@ -514,7 +501,6 @@ class AniBrowseApp(App):
             self.season_options = self.build_season_options_fast()
 
         self.load_view(self.current_view)
-        # self.refresh_season_options_async()
 
     def __init__(self) -> None:
         super().__init__()
@@ -547,6 +533,9 @@ class AniBrowseApp(App):
                     self.season_options.append((int(year), str(season)))
                 except Exception:
                     pass
+
+        self.selected_anime_for_episode_picker: Anime | None = None
+        self.episode_picker_episodes: list[int] = []
 
         saved_theme = settings.get("theme")
         if saved_theme:
@@ -601,6 +590,14 @@ class AniBrowseApp(App):
         self.query_one("#search", Input).focus()
 
     def action_unfocus_search(self) -> None:
+        if self.list_mode == "episode_picker":
+            self.list_mode = "anime"
+            self.selected_anime_for_episode_picker = None
+            self.episode_picker_episodes = []
+            self.populate_anime_list()
+            self.update_chrome()
+            return
+
         self.query_one("#anime-list", ListView).focus()
 
 
@@ -753,6 +750,82 @@ class AniBrowseApp(App):
             return False
 
 
+    def action_show_episode_picker(self) -> None:
+        if self.list_mode != "anime":
+            return
+
+        list_view = self.query_one("#anime-list", ListView)
+        if list_view.index is None:
+            return
+        if not self.current_anime_list:
+            return
+
+        anime = self.current_anime_list[list_view.index]
+
+        if anime.episodes is None:
+            try:
+                anime = get_anime_details(anime.id)
+                self.current_anime_list[list_view.index] = anime
+            except Exception:
+                self.notify("Could not load episode count", severity="error")
+                return
+
+        if anime.episodes is None or anime.episodes <= 0:
+            self.notify("Episode count is unavailable for this anime", severity="warning")
+            return
+
+        self.list_mode = "episode_picker"
+        self.selected_anime_for_episode_picker = anime
+        self.episode_picker_episodes = list(range(1, anime.episodes + 1))
+
+        list_view.clear()
+
+        for episode in self.episode_picker_episodes:
+            list_view.append(
+                ListItem(
+                    EpisodeListRow(episode),
+                    classes="episode-list-item",
+                )
+            )
+
+        list_view.index = 0
+
+        self.query_one("#details", AnimeDetails).update(
+            f"[b]{anime.title}[/b]\n\n"
+            f"Select an episode and press Enter to play it."
+        )
+
+        self.query_one("#status-bar", StatusBar).set_content(
+            f"ani-browse | Episode Picker | {anime.title}"
+        )
+        list_view.focus()
+
+    def play_selected_episode(self, anime: Anime, episode: int) -> None:
+        list_view = self.query_one("#anime-list", ListView)
+
+        try:
+            with self.suspend():
+                return_code = play_anime(
+                    anime,
+                    prefer_dub=self.prefer_dub,
+                    episode=episode,
+                )
+
+            list_view.focus()
+
+            if return_code == 0:
+                self.notify(f"Finished: {anime.title} episode {episode}")
+            elif return_code in (1, 2, 130):
+                self.notify("Playback cancelled")
+            else:
+                self.notify(f"Playback exited with code {return_code}", severity="warning")
+
+        except FileNotFoundError:
+            self.notify("ani-cli is not installed or not in PATH", severity="error")
+        except Exception as e:
+            self.notify(f"Playback failed: {e}", severity="error")
+
+
     def action_next_page(self) -> None:
         if not self.has_next_page:
             self.notify("No next page")
@@ -809,6 +882,14 @@ class AniBrowseApp(App):
             self.list_mode = "anime"
             self.load_view("seasonal")
             self.save_settings()
+        elif self.list_mode == "episode_picker":
+            if self.selected_anime_for_episode_picker is None:
+                return
+
+            episode = self.episode_picker_episodes[event.list_view.index]
+            anime = self.selected_anime_for_episode_picker
+
+            self.play_selected_episode(anime, episode)
         else:
             self.action_play_selected()
 
@@ -824,7 +905,7 @@ class AniBrowseApp(App):
 
         try:
             with self.suspend():
-                return_code = play_anime(anime.title, prefer_dub=self.prefer_dub)
+                return_code = play_anime(anime, prefer_dub=self.prefer_dub)
 
             list_view.focus()
 
@@ -850,6 +931,20 @@ class AniBrowseApp(App):
             self.query_one("#details", AnimeDetails).update(
                 f"[b]{year} {season.capitalize()}[/b]\n\n"
                 "Press Enter to load this seasonal anime list."
+            )
+            return
+        
+        if self.list_mode == "episode_picker":
+            if self.selected_anime_for_episode_picker is None:
+                return
+
+            episode = self.episode_picker_episodes[event.list_view.index]
+            anime = self.selected_anime_for_episode_picker
+
+            self.query_one("#details", AnimeDetails).update(
+                f"[b]{anime.title}[/b]\n\n"
+                f"[b]Episode:[/b] {episode}\n\n"
+                "Press Enter to play this episode."
             )
             return
 

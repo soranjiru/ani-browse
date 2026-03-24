@@ -21,7 +21,7 @@ _client: httpx.Client | None = None
 CACHE_DIR = Path.home() / ".cache" / "ani-browse"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-CACHE_TTL_SECONDS = 60 * 60 * 12  # 12 hours
+CACHE_TTL_SECONDS = 60 * 60 * 12
 
 CONFIG_DIR = Path.home() / ".config" / "ani-browse"
 APP_CONFIG_PATH = CONFIG_DIR / "config.json"
