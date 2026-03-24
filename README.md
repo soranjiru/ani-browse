@@ -25,6 +25,14 @@ A fast, keyboard-driven terminal UI to browse anime via MyAnimeList and watch wi
 pipx install git+https://github.com/soranjiru/ani-browse.git
 ```
 
+## Updating
+
+If you installed with `pipx`, update to the latest version with:
+
+```bash
+pipx upgrade ani-browse
+```
+
 ## Development
 
 ```bash
