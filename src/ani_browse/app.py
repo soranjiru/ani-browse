@@ -239,9 +239,11 @@ class AniBrowseApp(App):
             anime = get_anime_details(anime_id)
             self.call_from_thread(self._finish_load_anime_details, anime, list_index)
         except Exception as e:
-            self.call_from_thread(self.notify, f"Failed to load details: {e}", severity="error")
+            self.call_from_thread(self._detail_load_failed, anime_id, str(e))
 
     def _finish_load_anime_details(self, anime: Anime, list_index: int) -> None:
+        self._in_flight_detail_ids.discard(anime.id)
+
         if list_index >= len(self.current_anime_list):
             return
 
@@ -285,66 +287,56 @@ class AniBrowseApp(App):
             pass
 
     @work(exclusive=True, thread=True)
-    def load_view_async(self, view_name: str, selected_title: str | None = None) -> None:
+    def load_view_async(self) -> None:
+        request_key = self.make_page_request_key()
+
+        if request_key in self._in_flight_page_keys:
+            return
+
+        self._in_flight_page_keys.add(request_key)
 
         try:
-            if view_name == "seasonal":
+            offset = self.current_page * self.page_size
+
+            if self.current_view == "seasonal":
                 page = get_seasonal_anime(
                     self.season_year,
                     self.season_name,
                     limit=self.page_size,
-                    offset=self.current_offset,
+                    offset=offset,
                 )
-                anime_list = page.items
-
-            elif view_name == "popular":
-                page = get_ranking_anime(
-                    "bypopularity",
-                    limit=self.page_size,
-                    offset=self.current_offset,
-                )
-                anime_list = page.items
-
-            elif view_name == "upcoming":
-                page = get_ranking_anime(
-                    "upcoming",
-                    limit=self.page_size,
-                    offset=self.current_offset,
-                )
-                anime_list = page.items
-
-            elif view_name == "top":
-                page = get_ranking_anime(
-                    "all",
-                    limit=self.page_size,
-                    offset=self.current_offset,
-                )
-                anime_list = page.items
-
-            elif view_name == "search":
+            elif self.current_view == "search":
                 page = search_anime(
                     self.last_search_query,
                     limit=self.page_size,
-                    offset=self.current_offset,
+                    offset=offset,
                 )
-                anime_list = page.items
-
+            elif self.current_view == "popular":
+                page = get_ranking_anime(
+                    "bypopularity",
+                    limit=self.page_size,
+                    offset=offset,
+                )
+            elif self.current_view == "upcoming":
+                page = get_ranking_anime(
+                    "upcoming",
+                    limit=self.page_size,
+                    offset=offset,
+                )
             else:
-                page = AnimePage(items=[], has_next=False, has_previous=False)
-                anime_list = []
+                page = get_ranking_anime(
+                    "all",
+                    limit=self.page_size,
+                    offset=offset,
+                )
 
-            self.call_from_thread(
-                self._finish_load_view,
-                view_name,
-                anime_list,
-                page.has_next,
-                page.has_previous,
-                selected_title,
-            )
-
+            self.call_from_thread(self._finish_load_view, page, request_key)
         except Exception as e:
-            self.call_from_thread(self._handle_load_error, view_name, str(e))
+            self.call_from_thread(self._fail_load_view, request_key, str(e))
 
+    def _fail_load_view(self, request_key: str, message: str) -> None:
+        self._in_flight_page_keys.discard(request_key)
+        self.notify(f"Failed to load view: {message}", severity="error")
 
     @work(thread=True)
     def refresh_season_options_async(self) -> None:
@@ -362,29 +354,24 @@ class AniBrowseApp(App):
         self.save_settings()
         self.update_chrome()
 
-    def _finish_load_view(
-        self,
-        view_name: str,
-        anime_list: list[Anime],
-        has_next: bool,
-        has_previous: bool,
-        selected_title: str | None = None,
-    ) -> None:
-        self.current_anime_list = anime_list
-        self.has_next_page = has_next
-        self.has_previous_page = has_previous
+    def _finish_load_view(self, page: AnimePage, request_key: str) -> None:
+        self._in_flight_page_keys.discard(request_key)
 
-        self.populate_anime_list(selected_title=selected_title)
+        self.current_anime_list = page.items
+        self.has_next_page = page.has_next
+        self.has_previous_page = self.current_page > 0
+
+        self.populate_anime_list()
         self.update_chrome()
-        if has_next:
+
+        if page.has_next:
             self.prefetch_page(
-                view_name,
+                self.current_view,
                 self.current_page + 1,
                 season_year=self.season_year,
                 season_name=self.season_name,
                 search_query=self.last_search_query,
             )
-
 
     def _handle_load_error(self, view_name: str, message: str) -> None:
         self.current_anime_list = []
@@ -518,7 +505,7 @@ class AniBrowseApp(App):
         self.list_mode = "anime"
         self.prefer_dub = settings.get("prefer_dub", False)
 
-        self.page_size = settings.get("page_size", 50)
+        self.page_size = settings.get("page_size", 30)
         self.current_page = settings.get("current_page", 0)
         self.has_next_page = False
         self.has_previous_page = False
@@ -536,6 +523,11 @@ class AniBrowseApp(App):
 
         self.selected_anime_for_episode_picker: Anime | None = None
         self.episode_picker_episodes: list[int] = []
+
+        self._detail_debounce_timer = None
+        self._pending_detail_request: tuple[int, int] | None = None
+        self._in_flight_detail_ids: set[int] = set()
+        self._in_flight_page_keys: set[str] = set()
 
         saved_theme = settings.get("theme")
         if saved_theme:
@@ -581,15 +573,24 @@ class AniBrowseApp(App):
         self.has_next_page = False
         self.has_previous_page = self.current_page > 0
 
+        if self._detail_debounce_timer is not None:
+            self._detail_debounce_timer.stop()
+            self._detail_debounce_timer = None
+        self._pending_detail_request = None
+
         self.query_one("#details", AnimeDetails).update("[b]Loading...[/b]")
         self.update_chrome()
 
-        self.load_view_async(view_name, selected_title)
+        self.load_view_async()
 
     def action_focus_search(self) -> None:
         self.query_one("#search", Input).focus()
 
     def action_unfocus_search(self) -> None:
+        if self._detail_debounce_timer is not None:
+            self._detail_debounce_timer.stop()
+            self._detail_debounce_timer = None
+        self._pending_detail_request = None
         if self.list_mode == "episode_picker":
             self.list_mode = "anime"
             self.selected_anime_for_episode_picker = None
@@ -600,6 +601,55 @@ class AniBrowseApp(App):
 
         self.query_one("#anime-list", ListView).focus()
 
+    def queue_detail_load(self, anime_id: int, list_index: int) -> None:
+        self._pending_detail_request = (anime_id, list_index)
+
+        if self._detail_debounce_timer is not None:
+            self._detail_debounce_timer.stop()
+
+        self._detail_debounce_timer = self.set_timer(
+            0.15,
+            self._run_queued_detail_load,
+        )
+
+    def _run_queued_detail_load(self) -> None:
+        self._detail_debounce_timer = None
+
+        if self._pending_detail_request is None:
+            return
+
+        anime_id, list_index = self._pending_detail_request
+        self._pending_detail_request = None
+
+        if list_index >= len(self.current_anime_list):
+            return
+
+        current = self.current_anime_list[list_index]
+        if current.id != anime_id:
+            return
+
+        if anime_id in self._in_flight_detail_ids:
+            return
+
+        self._in_flight_detail_ids.add(anime_id)
+        self.load_anime_details_async(anime_id, list_index)
+
+    def _detail_load_failed(self, anime_id: int, message: str) -> None:
+        self._in_flight_detail_ids.discard(anime_id)
+        self.notify(f"Failed to load details: {message}", severity="error")
+
+    def make_page_request_key(self) -> str:
+        return "|".join(
+            [
+                self.current_view,
+                str(self.current_page),
+                str(self.page_size),
+                self.last_search_query,
+                str(self.season_year),
+                self.season_name,
+                str(self.prefer_dub),
+            ]
+        )
 
     def build_season_options(
         self,
@@ -959,12 +1009,11 @@ class AniBrowseApp(App):
         needs_detail_fetch = (
             anime.episodes is None
             or not anime.genres
-            or anime.synopsis == "No synopsis available."
+            or anime.synopsis == "Fetching synopsis."
         )
 
-        if needs_detail_fetch:
-            self.query_one("#details", AnimeDetails).update("[b]Loading details...[/b]")
-            self.load_anime_details_async(anime.id, index)
+        if needs_detail_fetch and anime.id not in self._in_flight_detail_ids:
+            self.queue_detail_load(anime.id, index)
 
     def action_refresh_view(self) -> None:
         if self.current_view == "seasonal":

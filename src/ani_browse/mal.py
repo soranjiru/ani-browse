@@ -1,5 +1,6 @@
 import os
 import json
+import msgspec
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,7 +90,7 @@ _detail_memory_cache: dict[int, Anime] = {}
 
 def _cache_path(key: str) -> Path:
     safe_key = key.replace("/", "_").replace(":", "_").replace(" ", "_")
-    return CACHE_DIR / f"{safe_key}.json"
+    return CACHE_DIR / f"{safe_key}.msgpack"
 
 
 def _anime_to_dict(anime: Anime) -> dict:
@@ -135,8 +136,11 @@ def _load_from_cache(key: str) -> AnimePage | None:
         return None
 
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = msgspec.msgpack.decode(path.read_bytes())
     except Exception:
+        return None
+
+    if not isinstance(payload, dict):
         return None
 
     timestamp = payload.get("timestamp")
@@ -146,11 +150,15 @@ def _load_from_cache(key: str) -> AnimePage | None:
     if time.time() - timestamp > CACHE_TTL_SECONDS:
         return None
 
-    items = [_anime_from_dict(item) for item in payload.get("items", [])]
+    raw_items = payload.get("items", [])
+    if not isinstance(raw_items, list):
+        return None
+
+    items = [_anime_from_dict(item) for item in raw_items if isinstance(item, dict)]
     page = AnimePage(
         items=items,
-        has_next=payload.get("has_next", False),
-        has_previous=payload.get("has_previous", False),
+        has_next=bool(payload.get("has_next", False)),
+        has_previous=bool(payload.get("has_previous", False)),
     )
     _memory_cache[key] = page
     return page
@@ -166,16 +174,13 @@ def _save_to_cache(key: str, page: AnimePage) -> None:
         "has_previous": page.has_previous,
     }
 
-    _cache_path(key).write_text(
-        json.dumps(payload, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    _cache_path(key).write_bytes(msgspec.msgpack.encode(payload))
 
 def clear_cache() -> None:
     _memory_cache.clear()
     _detail_memory_cache.clear()
 
-    for path in CACHE_DIR.glob("*.json"):
+    for path in CACHE_DIR.glob("*.msgpack"):
         path.unlink(missing_ok=True)
 
 
@@ -198,7 +203,7 @@ def make_ranking_cache_key(ranking_type: str, limit: int, offset: int) -> str:
 
 
 def _detail_cache_path(anime_id: int) -> Path:
-    return CACHE_DIR / f"anime-detail-{anime_id}.json"
+    return CACHE_DIR / f"anime-detail-{anime_id}.msgpack"
 
 
 def _load_anime_detail_from_cache(anime_id: int) -> Anime | None:
@@ -210,8 +215,11 @@ def _load_anime_detail_from_cache(anime_id: int) -> Anime | None:
         return None
 
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = msgspec.msgpack.decode(path.read_bytes())
     except Exception:
+        return None
+
+    if not isinstance(payload, dict):
         return None
 
     timestamp = payload.get("timestamp")
@@ -238,10 +246,7 @@ def _save_anime_detail_to_cache(anime: Anime) -> None:
         "anime": _anime_to_dict(anime),
     }
 
-    _detail_cache_path(anime.id).write_text(
-        json.dumps(payload, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    _detail_cache_path(anime.id).write_bytes(msgspec.msgpack.encode(payload))
 
 def get_anime_details(anime_id: int) -> Anime:
     cached = _load_anime_detail_from_cache(anime_id)
@@ -288,7 +293,7 @@ def parse_anime(node: dict) -> Anime:
     title = node.get("title", "Unknown Title")
     score = node.get("mean")
     episodes = node.get("num_episodes")
-    synopsis = node.get("synopsis") or "No synopsis available."
+    synopsis = node.get("synopsis") or "Fetching synopsis..."
 
     genres = [genre["name"] for genre in node.get("genres", [])]
 
@@ -318,7 +323,7 @@ def parse_anime(node: dict) -> Anime:
     anime.finalize_display_fields()
     return anime
 
-def search_anime(query: str, limit: int = 50, offset: int = 0) -> AnimePage:
+def search_anime(query: str, limit: int = 25, offset: int = 0) -> AnimePage:
     cache_key = make_search_cache_key(query, limit, offset)
     cached = _load_from_cache(cache_key)
     if cached is not None:
@@ -343,7 +348,7 @@ def search_anime(query: str, limit: int = 50, offset: int = 0) -> AnimePage:
     return page
 
 
-def get_seasonal_anime(year: int, season: str, limit: int = 50, offset: int = 0) -> AnimePage:
+def get_seasonal_anime(year: int, season: str, limit: int = 30, offset: int = 0) -> AnimePage:
     cache_key = make_seasonal_cache_key(year, season, limit, offset)
     cached = _load_from_cache(cache_key)
     if cached is not None:
@@ -371,7 +376,7 @@ def get_seasonal_anime(year: int, season: str, limit: int = 50, offset: int = 0)
     return page
 
 
-def get_ranking_anime(ranking_type: str, limit: int = 50, offset: int = 0) -> AnimePage:
+def get_ranking_anime(ranking_type: str, limit: int = 30, offset: int = 0) -> AnimePage:
     cache_key = make_ranking_cache_key(ranking_type, limit, offset)
     cached = _load_from_cache(cache_key)
     if cached is not None:

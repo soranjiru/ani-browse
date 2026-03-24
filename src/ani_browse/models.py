@@ -10,7 +10,7 @@ class Anime:
     episodes: int | None = None
     status: str = "Unknown"
     season: str = "Unknown"
-    synopsis: str = "No synopsis available."
+    synopsis: str = "Fetching Synopsis..."
     rank: int | None = None
     popularity: int | None = None
     members: int | None = None
