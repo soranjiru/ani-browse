@@ -13,6 +13,11 @@ load_dotenv()
 
 BASE_URL = "https://api.myanimelist.net/v2"
 
+LIST_FIELDS = "id,title,mean,start_season,status,rank"
+DETAIL_FIELDS = "id,title,mean,num_episodes,synopsis,genres,start_season,status,rank,popularity,num_list_users"
+
+_client: httpx.Client | None = None
+
 CACHE_DIR = Path.home() / ".cache" / "ani-browse"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -20,6 +25,20 @@ CACHE_TTL_SECONDS = 60 * 60 * 12  # 12 hours
 
 CONFIG_DIR = Path.home() / ".config" / "ani-browse"
 APP_CONFIG_PATH = CONFIG_DIR / "config.json"
+
+def get_http_client() -> httpx.Client:
+    global _client
+
+    if _client is None:
+        _client = httpx.Client(
+            base_url=BASE_URL,
+            timeout=15.0,
+        )
+
+    return _client
+
+def _get_headers() -> dict[str, str]:
+    return {"X-MAL-CLIENT-ID": get_client_id()}
 
 def load_app_config() -> dict:
     if not APP_CONFIG_PATH.exists():
@@ -47,13 +66,11 @@ def get_saved_client_id() -> str | None:
     return None
 
 def validate_client_id(client_id: str) -> bool:
-    headers = {"X-MAL-CLIENT-ID": client_id}
     try:
-        response = httpx.get(
-            f"{BASE_URL}/anime/ranking",
-            headers=headers,
+        response = get_http_client().get(
+            "/anime/ranking",
+            headers={"X-MAL-CLIENT-ID": client_id},
             params={"ranking_type": "all", "limit": 1},
-            timeout=10.0,
         )
         response.raise_for_status()
         return True
@@ -68,6 +85,7 @@ class AnimePage:
 
 
 _memory_cache: dict[str, AnimePage] = {}
+_detail_memory_cache: dict[int, Anime] = {}
 
 def _cache_path(key: str) -> Path:
     safe_key = key.replace("/", "_").replace(":", "_").replace(" ", "_")
@@ -91,7 +109,7 @@ def _anime_to_dict(anime: Anime) -> dict:
 
 
 def _anime_from_dict(data: dict) -> Anime:
-    return Anime(
+    anime = Anime(
         id=data["id"],
         title=data["title"],
         score=data["score"],
@@ -104,6 +122,8 @@ def _anime_from_dict(data: dict) -> Anime:
         popularity=data.get("popularity"),
         members=data.get("members"),
     )
+    anime.finalize_display_fields()
+    return anime
 
 
 def _load_from_cache(key: str) -> AnimePage | None:
@@ -153,6 +173,7 @@ def _save_to_cache(key: str, page: AnimePage) -> None:
 
 def clear_cache() -> None:
     _memory_cache.clear()
+    _detail_memory_cache.clear()
 
     for path in CACHE_DIR.glob("*.json"):
         path.unlink(missing_ok=True)
@@ -174,6 +195,69 @@ def make_search_cache_key(query: str, limit: int, offset: int) -> str:
 
 def make_ranking_cache_key(ranking_type: str, limit: int, offset: int) -> str:
     return f"ranking:{ranking_type}:{limit}:{offset}"
+
+
+def _detail_cache_path(anime_id: int) -> Path:
+    return CACHE_DIR / f"anime-detail-{anime_id}.json"
+
+
+def _load_anime_detail_from_cache(anime_id: int) -> Anime | None:
+    if anime_id in _detail_memory_cache:
+        return _detail_memory_cache[anime_id]
+
+    path = _detail_cache_path(anime_id)
+    if not path.exists():
+        return None
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)):
+        return None
+
+    if time.time() - timestamp > CACHE_TTL_SECONDS:
+        return None
+
+    anime_data = payload.get("anime")
+    if not isinstance(anime_data, dict):
+        return None
+
+    anime = _anime_from_dict(anime_data)
+    _detail_memory_cache[anime_id] = anime
+    return anime
+
+
+def _save_anime_detail_to_cache(anime: Anime) -> None:
+    _detail_memory_cache[anime.id] = anime
+
+    payload = {
+        "timestamp": time.time(),
+        "anime": _anime_to_dict(anime),
+    }
+
+    _detail_cache_path(anime.id).write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+def get_anime_details(anime_id: int) -> Anime:
+    cached = _load_anime_detail_from_cache(anime_id)
+    if cached is not None:
+        return cached
+
+    response = get_http_client().get(
+        f"/anime/{anime_id}",
+        headers=_get_headers(),
+        params={"fields": DETAIL_FIELDS},
+    )
+    response.raise_for_status()
+
+    anime = parse_anime(response.json())
+    _save_anime_detail_to_cache(anime)
+    return anime
 
 def has_client_id() -> bool:
     try:
@@ -218,7 +302,7 @@ def parse_anime(node: dict) -> Anime:
 
     status = node.get("status", "unknown").replace("_", " ").title()
 
-    return Anime(
+    anime = Anime(
         id=node["id"],
         title=title,
         score=score,
@@ -231,6 +315,8 @@ def parse_anime(node: dict) -> Anime:
         popularity=node.get("popularity"),
         members=node.get("num_list_users"),
     )
+    anime.finalize_display_fields()
+    return anime
 
 def search_anime(query: str, limit: int = 50, offset: int = 0) -> AnimePage:
     cache_key = make_search_cache_key(query, limit, offset)
@@ -238,15 +324,14 @@ def search_anime(query: str, limit: int = 50, offset: int = 0) -> AnimePage:
     if cached is not None:
         return cached
 
-    headers = {"X-MAL-CLIENT-ID": get_client_id()}
     params = {
         "q": query,
         "limit": limit,
         "offset": offset,
-        "fields": "id,title,mean,num_episodes,synopsis,genres,start_season,status,rank,popularity,num_list_users",
+        "fields": LIST_FIELDS,
     }
 
-    response = httpx.get(f"{BASE_URL}/anime", headers=headers, params=params, timeout=15.0)
+    response = get_http_client().get("/anime", headers=_get_headers(), params=params)
     response.raise_for_status()
 
     payload = response.json()
@@ -264,18 +349,16 @@ def get_seasonal_anime(year: int, season: str, limit: int = 50, offset: int = 0)
     if cached is not None:
         return cached
 
-    headers = {"X-MAL-CLIENT-ID": get_client_id()}
     params = {
         "limit": limit,
         "offset": offset,
-        "fields": "id,title,mean,num_episodes,synopsis,genres,start_season,status,rank,popularity,num_list_users",
+        "fields": LIST_FIELDS,
     }
 
-    response = httpx.get(
-        f"{BASE_URL}/anime/season/{year}/{season}",
-        headers=headers,
+    response = get_http_client().get(
+        f"/anime/season/{year}/{season}",
+        headers=_get_headers(),
         params=params,
-        timeout=15.0,
     )
     response.raise_for_status()
 
@@ -294,15 +377,18 @@ def get_ranking_anime(ranking_type: str, limit: int = 50, offset: int = 0) -> An
     if cached is not None:
         return cached
 
-    headers = {"X-MAL-CLIENT-ID": get_client_id()}
     params = {
         "ranking_type": ranking_type,
         "limit": limit,
         "offset": offset,
-        "fields": "id,title,mean,num_episodes,synopsis,genres,start_season,status,rank,popularity,num_list_users",
+        "fields": LIST_FIELDS,
     }
 
-    response = httpx.get(f"{BASE_URL}/anime/ranking", headers=headers, params=params, timeout=15.0)
+    response = get_http_client().get(
+        "/anime/ranking",
+        headers=_get_headers(),
+        params=params,
+    )
     response.raise_for_status()
 
     payload = response.json()

@@ -10,6 +10,7 @@ from .mal import (
     get_seasonal_anime,
     search_anime,
     get_ranking_anime,
+    get_anime_details,
     clear_cache_key,
     make_seasonal_cache_key,
     make_search_cache_key,
@@ -26,15 +27,21 @@ import json
 from pathlib import Path
 import webbrowser
 
+# class AnimeListRow(Static):
+#     def __init__(self, anime: Anime) -> None:
+#         self.anime = anime
+
+#         score = f"{anime.score:.1f}" if anime.score is not None else "N/A"
+#         secondary = anime.season if anime.season else anime.status
+#         title = f"#{anime.rank} {anime.title}" if anime.rank is not None else anime.title
+
+#         text = f"[b]{title}[/b]\n[dim]{score} • {secondary}[/dim]"
+#         super().__init__(text, classes="anime-row")
+
 class AnimeListRow(Static):
     def __init__(self, anime: Anime) -> None:
         self.anime = anime
-
-        score = f"{anime.score:.1f}" if anime.score is not None else "N/A"
-        secondary = anime.season if anime.season else anime.status
-        title = f"#{anime.rank} {anime.title}" if anime.rank is not None else anime.title
-
-        text = f"[b]{title}[/b]\n[dim]{score} • {secondary}[/dim]"
+        text = f"[b]{anime.list_title}[/b]\n[dim]{anime.list_subtitle}[/dim]"
         super().__init__(text, classes="anime-row")
 
 
@@ -45,24 +52,26 @@ class SeasonListRow(Static):
         self.season = season
 
 
+# class AnimeDetails(Static):
+#     def show_anime(self, anime: Anime) -> None:
+#         score = f"{anime.score:.1f}" if anime.score is not None else "N/A"
+#         episodes = anime.episodes if anime.episodes is not None else "N/A"
+#         genres = ", ".join(anime.genres) if anime.genres else "N/A"
+
+#         self.update(
+#             f"[b]{anime.title}[/b]\n"
+#             f"{'─' * len(anime.title)}\n\n"
+#             f"[b]Score:[/b] {score}\n"
+#             f"[b]Episodes:[/b] {episodes}\n"
+#             f"[b]Status:[/b] {anime.status}\n"
+#             f"[b]Season:[/b] {anime.season}\n"
+#             f"[b]Genres:[/b] {genres}\n\n"
+#             f"[b]Synopsis[/b]\n"
+#             f"{anime.synopsis}"
+#         )
 class AnimeDetails(Static):
     def show_anime(self, anime: Anime) -> None:
-        score = f"{anime.score:.1f}" if anime.score is not None else "N/A"
-        episodes = anime.episodes if anime.episodes is not None else "N/A"
-        genres = ", ".join(anime.genres) if anime.genres else "N/A"
-
-        self.update(
-            f"[b]{anime.title}[/b]\n"
-            f"{'─' * len(anime.title)}\n\n"
-            f"[b]Score:[/b] {score}\n"
-            f"[b]Episodes:[/b] {episodes}\n"
-            f"[b]Status:[/b] {anime.status}\n"
-            f"[b]Season:[/b] {anime.season}\n"
-            f"[b]Genres:[/b] {genres}\n\n"
-            f"[b]Synopsis[/b]\n"
-            f"{anime.synopsis}"
-        )
-
+        self.update(anime.details_text)
 
 class StatusBar(Static):
     def set_content(self, text: str) -> None:
@@ -237,6 +246,26 @@ class AniBrowseApp(App):
 
         self.query_one("#status-bar", StatusBar).set_content("  ".join(parts))
 
+    @work(exclusive=True, thread=True)
+    def load_anime_details_async(self, anime_id: int, list_index: int) -> None:
+        try:
+            anime = get_anime_details(anime_id)
+            self.call_from_thread(self._finish_load_anime_details, anime, list_index)
+        except Exception as e:
+            self.call_from_thread(self.notify, f"Failed to load details: {e}", severity="error")
+
+    def _finish_load_anime_details(self, anime: Anime, list_index: int) -> None:
+        if list_index >= len(self.current_anime_list):
+            return
+
+        if self.current_anime_list[list_index].id != anime.id:
+            return
+
+        self.current_anime_list[list_index] = anime
+
+        list_view = self.query_one("#anime-list", ListView)
+        if list_view.index == list_index:
+            self.query_one("#details", AnimeDetails).show_anime(anime)
 
     @work(thread=True)
     def prefetch_page(
@@ -270,15 +299,6 @@ class AniBrowseApp(App):
 
     @work(exclusive=True, thread=True)
     def load_view_async(self, view_name: str, selected_title: str | None = None) -> None:
-        self.has_next_page = False
-        self.has_previous_page = self.current_page > 0
-        self.call_from_thread(self.update_chrome)
-
-        self.current_view = view_name
-        self.list_mode = "anime"
-
-        details = self.query_one("#details", AnimeDetails)
-        details.update("[b]Loading...[/b]")
 
         try:
             if view_name == "seasonal":
@@ -494,7 +514,7 @@ class AniBrowseApp(App):
             self.season_options = self.build_season_options_fast()
 
         self.load_view(self.current_view)
-        self.refresh_season_options_async()
+        # self.refresh_season_options_async()
 
     def __init__(self) -> None:
         super().__init__()
@@ -562,12 +582,19 @@ class AniBrowseApp(App):
 
         self.load_view(self.current_view)
         self.query_one("#anime-list", ListView).focus()
-        self.refresh_season_options_async()
 
     def on_unmount(self) -> None:
         self.save_settings()
 
     def load_view(self, view_name: str, selected_title: str | None = None) -> None:
+        self.current_view = view_name
+        self.list_mode = "anime"
+        self.has_next_page = False
+        self.has_previous_page = self.current_page > 0
+
+        self.query_one("#details", AnimeDetails).update("[b]Loading...[/b]")
+        self.update_chrome()
+
         self.load_view_async(view_name, selected_title)
 
     def action_focus_search(self) -> None:
@@ -829,8 +856,20 @@ class AniBrowseApp(App):
         if not self.current_anime_list:
             return
 
-        anime = self.current_anime_list[event.list_view.index]
+        index = event.list_view.index
+        anime = self.current_anime_list[index]
+
         self.query_one("#details", AnimeDetails).show_anime(anime)
+
+        needs_detail_fetch = (
+            anime.episodes is None
+            or not anime.genres
+            or anime.synopsis == "No synopsis available."
+        )
+
+        if needs_detail_fetch:
+            self.query_one("#details", AnimeDetails).update("[b]Loading details...[/b]")
+            self.load_anime_details_async(anime.id, index)
 
     def action_refresh_view(self) -> None:
         if self.current_view == "seasonal":
