@@ -60,7 +60,7 @@ def validate_client_id(client_id: str) -> bool:
     except Exception:
         return False
 
-@dataclass
+@dataclass(slots=True)
 class AnimePage:
     items: list[Anime]
     has_next: bool
